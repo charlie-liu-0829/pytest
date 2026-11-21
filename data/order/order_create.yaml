@@ -15,7 +15,7 @@ cases:
       url: ${API_BASE_URL}/api/orders
       json:
         "productIds": [101]
-        "addressId": 9
+        "addressId": 0  # 运行时由 create_order fixture 替换为当前用户新建的地址
     expected:
       status_code: 200
       code: 0

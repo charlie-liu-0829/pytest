@@ -1,4 +1,5 @@
 from jsonpath import jsonpath
+from decimal import Decimal
 import pytest
 from pathlib import Path
 
@@ -76,12 +77,31 @@ class TestProduct:
 
     @pytest.mark.productManagement
     @case_parametrize(case_path + "/product_change_product.yaml")
-    def test_change_product(self, case_info, admin_token, http_client):
+    def test_change_product(self, case_info, admin_token, http_client, request):
 
-        request = case_info["request"]
-        resp = http_client.send_all_request(token=admin_token, **request)
+        api_request = case_info["request"]
+        code = case_info["expected"]["code"]
+        if code == 0:
+            fixture = (
+                "on_sale_product"
+                if case_info.get("product_state") == "ON_SALE"
+                else "deletable_product"
+            )
+            resource = request.getfixturevalue(fixture)
+            api_request = replace_path_id(api_request, 116, resource.resource_id)
+        resp = http_client.send_all_request(token=admin_token, **api_request)
 
         assert_response(resp, case_info["expected"])
+        if code == 0:
+            detail = http_client.send_all_request(
+                method="GET",
+                url=f"/api/products/{resource.resource_id}",
+                token=admin_token,
+            )
+            actual = response_value(detail, "$.data.price")
+            assert Decimal(str(actual)) == Decimal(str(api_request["json"]["price"]))
+            if case_info.get("product_state") == "ON_SALE":
+                assert response_value(detail, "$.data.status") == "ON_SALE"
 
     @pytest.mark.productManagement
     @case_parametrize(case_path + "/product_on_sale.yaml")

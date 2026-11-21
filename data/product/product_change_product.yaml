@@ -1,7 +1,7 @@
 ids:
   - 修改商品成功
   - 商品不存在，修改失败
-  - 已上架商品不允许修改价格，修改失败
+  - 已上架商品修改价格成功
 
 cases:
   - feature: 商品模块
@@ -38,7 +38,8 @@ cases:
 
   - feature: 商品模块
     story: 修改商品
-    title: 已上架商品不允许修改价格
+    title: 已上架商品修改价格成功
+    product_state: ON_SALE
     request:
       method: PUT
       url: ${API_BASE_URL}/api/admin/products/116
@@ -48,6 +49,6 @@ cases:
         "description": "家用 360° 音响 / 5单元阵列 · 90W · 蓝牙5.3+AirPlay 2+有线"
         "price": 18999.00
     expected:
-      status_code: 400
-      code: 12008
-      msg: 已上架商品不允许修改价格
+      status_code: 200
+      code: 0
+      msg: success

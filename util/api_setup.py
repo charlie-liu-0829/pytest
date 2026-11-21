@@ -70,6 +70,7 @@ def create_product(
             "name": name,
             "description": "fixture-created product",
             "price": 1.00,
+            "mainImageUrl": "https://example.test/fixture-main.jpg",
         },
         token=token,
     )

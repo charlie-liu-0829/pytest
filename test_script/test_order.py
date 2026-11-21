@@ -1,8 +1,8 @@
-from jsonpath import jsonpath
+from copy import deepcopy
 import pytest
 from pathlib import Path
 
-from util.api_setup import replace_path_id
+from util.api_setup import api_url, replace_path_id, response_value
 from util.case_util import case_parametrize
 from util.assert_util import assert_response
 
@@ -15,10 +15,24 @@ class TestOrder:
     @case_parametrize(case_path + "/order_create.yaml")
     def test_create_order(self, case_info, create_order, http_client):
 
-        request = case_info["request"]
-        resp = http_client.send_all_request(token=create_order, **request)
-
-        assert_response(resp, case_info["expected"])
+        request = deepcopy(case_info["request"])
+        request["json"]["addressId"] = create_order.resource_id
+        resp = http_client.send_all_request(token=create_order.token, **request)
+        order_id = (
+            response_value(resp, "$.data.orderId")
+            if resp.json().get("code") == 0
+            else None
+        )
+        try:
+            assert_response(resp, case_info["expected"])
+        finally:
+            if order_id is not None:
+                http_client.send_all_request(
+                    method="PUT",
+                    url=api_url(f"/api/orders/{order_id}/cancel"),
+                    token=create_order.token,
+                    json={"cancelReason": "fixture cleanup"},
+                )
 
     @pytest.mark.order
     @case_parametrize(case_path + "/order_check.yaml")

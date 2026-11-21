@@ -10,7 +10,7 @@ import yaml
 
 import conftest as fixtures
 import main as runner
-from util.api_setup import replace_path_id, response_json
+from util.api_setup import ApiResource, create_product, replace_path_id, response_json
 from util.assert_util import assert_response
 from util.yaml_util import YamlUtil
 
@@ -22,6 +22,19 @@ def response(body, status=200):
 def test_response_checks_http_even_when_business_body_matches():
     with pytest.raises(AssertionError, match="HTTP 状态码"):
         assert_response(response({"code": 0}, 500), {"code": 0})
+
+
+def test_http_failure_includes_business_error_without_response_data():
+    resp = response(
+        {"code": 400, "msg": "商品主图不能为空", "data": {"token": "private-token"}},
+        400,
+    )
+    with pytest.raises(AssertionError) as failure:
+        assert_response(resp, {"code": 0})
+    message = str(failure.value)
+    assert "code=400" in message
+    assert "商品主图不能为空" in message
+    assert "private-token" not in message
 
 
 @pytest.mark.parametrize(
@@ -234,3 +247,94 @@ def test_address_fixture_creates_and_cleans_up_its_own_address(monkeypatch):
     assert requests[2]["method"] == "DELETE"
     assert requests[2]["url"].endswith("/addresses/42")
     assert requests[3]["url"].endswith("/addresses/9/default")
+
+
+def test_fixture_product_contains_required_main_image():
+    client = Mock()
+    client.send_all_request.return_value = response(
+        {"code": 0, "data": {"productId": 42}}
+    )
+    product = create_product(client, "admin-token")
+    assert product.resource_id == 42
+    assert client.send_all_request.call_args.kwargs["json"]["mainImageUrl"]
+
+
+def test_product_creation_cases_reach_business_validation():
+    root = Path(__file__).resolve().parents[2]
+    cases, _ = YamlUtil(root / "data/product/product_create_product.yaml").read_cases()
+    for case in cases:
+        assert case["request"]["json"]["mainImageUrl"]
+
+
+def test_order_setup_uses_new_address_and_cleans_cart():
+    client = Mock()
+    client.send_all_request.side_effect = [
+        response({"code": 0}),
+        response({"code": 0}),
+        response({"code": 0, "data": {"orderId": 123}}),
+        response({"code": 0}),
+    ]
+    scenario = fixtures._create_order_via_api(client, ApiResource("user-token", 42))
+    assert scenario.order_id == 123
+    requests = [call.kwargs for call in client.send_all_request.call_args_list]
+    assert requests[2]["json"]["addressId"] == 42
+    assert requests[2]["token"] == "user-token"
+    assert requests[-1]["method"] == "DELETE"
+    assert requests[-1]["url"].endswith("/cart/items/101")
+
+
+def test_failed_order_setup_still_cleans_cart():
+    client = Mock()
+    client.send_all_request.side_effect = [
+        response({"code": 0}),
+        response({"code": 0}),
+        response({"code": 15004, "msg": "收货地址不存在"}, 400),
+        response({"code": 0}),
+    ]
+    with pytest.raises(AssertionError, match="收货地址不存在"):
+        fixtures._create_order_via_api(client, ApiResource("user-token", 42))
+    assert client.send_all_request.call_args.kwargs["method"] == "DELETE"
+
+
+def test_order_address_fixture_cleans_the_address_it_created():
+    client = Mock()
+    client.send_all_request.side_effect = [
+        response({"code": 0, "data": {"token": "user-token"}}),
+        response({"code": 0, "data": {"addressId": 42}}),
+        response({"code": 0}),
+    ]
+    fixture = fixtures.order_address.__wrapped__(client)
+    address = next(fixture)
+    assert address == ApiResource("user-token", 42)
+    with pytest.raises(StopIteration):
+        next(fixture)
+    cleanup = client.send_all_request.call_args.kwargs
+    assert cleanup["method"] == "DELETE"
+    assert cleanup["url"].endswith("/addresses/42")
+
+
+@pytest.mark.parametrize("code", [0, 13001, 13002, 13004])
+def test_inventory_setup_only_initializes_for_duplicate_case(code):
+    client = Mock()
+    client.send_all_request.return_value = response({"code": 0})
+    product = ApiResource("admin-token", 42)
+    result = fixtures.init_inventory.__wrapped__(
+        client, product, {"expected": {"code": code}}
+    )
+    assert result is product
+    if code == 13004:
+        setup = client.send_all_request.call_args.kwargs
+        assert setup["json"] == {"productId": 42, "quantity": 10}
+    else:
+        client.send_all_request.assert_not_called()
+
+
+def test_restock_setup_initializes_only_the_disposable_product():
+    client = Mock()
+    client.send_all_request.return_value = response({"code": 0})
+    product = ApiResource("admin-token", 42)
+    assert fixtures.restock_inventory.__wrapped__(client, product) is product
+    assert client.send_all_request.call_args.kwargs["json"] == {
+        "productId": 42,
+        "quantity": 10,
+    }

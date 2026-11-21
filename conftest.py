@@ -262,89 +262,53 @@ def on_sale_product(http_client, admin_token):
         )
 
 
-@pytest.fixture(scope="class")
-def init_inventory(http_client, db):
-    """Prepare the one state that the source API cannot create.
-
-    Product creation automatically creates an inventory row and the source has
-    no inventory-delete/reset endpoint. Therefore only this boundary uses SQL:
-    reset the two existing rows to zero, run the initialization API tests, then restore their
-    original available quantities through the API.
-    """
-    token = _login(http_client, ADMIN_LOGIN)
-    product_ids = (115, 116)
-    snapshots = {}
-    for product_id in product_ids:
-        response = http_client.send_all_request(
-            method="GET", url=api_url(f"/api/products/{product_id}/inventory")
-        )
-        body = response_json(response)
-        if body.get("code") == 0:
-            snapshots[product_id] = body.get("data", {}).get("availableStock", 0)
-    db.execute_sql(
-        "DELETE FROM inventory_log WHERE product_id IN (%s, %s)",
-        product_ids,
-    )
-    db.execute_sql(
-        "UPDATE inventory SET total_stock = 0, available_stock = 0, "
-        "frozen_stock = 0 WHERE product_id IN (%s, %s)",
-        product_ids,
-    )
-    try:
-        yield token
-    finally:
-        # Restore via the business API; SQL is only needed for the unavoidable
-        # precondition because no reset/delete endpoint exists in the source.
-        db.execute_sql(
-            "UPDATE inventory SET total_stock = 0, available_stock = 0, "
-            "frozen_stock = 0 WHERE product_id IN (%s, %s)",
-            product_ids,
-        )
-        for product_id, quantity in snapshots.items():
-            response = http_client.send_all_request(
+@pytest.fixture
+def init_inventory(http_client, deletable_product, case_info):
+    """A fresh product provides zero stock without resetting existing records."""
+    if case_info["expected"]["code"] == 13004:
+        response_json(
+            http_client.send_all_request(
                 method="POST",
                 url=api_url("/api/admin/inventory"),
-                json={"productId": product_id, "quantity": quantity},
-                token=token,
+                json={"productId": deletable_product.resource_id, "quantity": 10},
+                token=deletable_product.token,
             )
-            if response.status_code >= 400:
-                logger.warning("inventory restore failed for product %s", product_id)
+        )
+    return deletable_product
 
 
-@pytest.fixture(scope="class")
-def restock_inventory(http_client):
-    """Arrange a restockable inventory through inventory APIs."""
-    token = _login(http_client, ADMIN_LOGIN)
-    inventory = http_client.send_all_request(
-        method="GET", url=api_url("/api/products/116/inventory")
-    )
-    body = response_json(inventory)
-    if body.get("code") != 0:
-        init = http_client.send_all_request(
+@pytest.fixture
+def restock_inventory(http_client, deletable_product):
+    """Restock an isolated product instead of increasing seed stock each run."""
+    response_json(
+        http_client.send_all_request(
             method="POST",
             url=api_url("/api/admin/inventory"),
-            json={"productId": 116, "quantity": 10},
-            token=token,
+            json={"productId": deletable_product.resource_id, "quantity": 10},
+            token=deletable_product.token,
         )
-        response_json(init)
-    yield token
+    )
+    return deletable_product
 
 
-def _create_order_via_api(client: RequestUtil) -> OrderScenario:
+def _create_order_via_api(client: RequestUtil, address: ApiResource) -> OrderScenario:
     """Create a pending order by following the real cart/order workflow."""
-    user_token = _login(client, USER_LOGIN)
+    user_token = address.token
     item_url = api_url("/api/cart/items/101")
     # DELETE is idempotent for this setup; an empty cart is a valid state.
     client.send_all_request(method="DELETE", url=item_url, token=user_token)
-    added = client.send_all_request(token=user_token, **CART_ITEM)
-    response_json(added)
-    created = client.send_all_request(
-        method="POST",
-        url=api_url("/api/orders"),
-        json={"productIds": [101], "addressId": 9},
-        token=user_token,
-    )
-    order_id = int(response_value(created, "$..orderId"))
+    try:
+        added = client.send_all_request(token=user_token, **CART_ITEM)
+        response_json(added)
+        created = client.send_all_request(
+            method="POST",
+            url=api_url("/api/orders"),
+            json={"productIds": [101], "addressId": address.resource_id},
+            token=user_token,
+        )
+        order_id = int(response_value(created, "$..orderId"))
+    finally:
+        client.send_all_request(method="DELETE", url=item_url, token=user_token)
     return OrderScenario(token=user_token, user_token=user_token, order_id=order_id)
 
 
@@ -358,13 +322,13 @@ def _order_action(
 
 
 @pytest.fixture(scope="class")
-def create_order(http_client):
-    token = _login(http_client, USER_LOGIN)
+def create_order(http_client, order_address):
+    token = order_address.token
     item_url = api_url("/api/cart/items/101")
     http_client.send_all_request(method="DELETE", url=item_url, token=token)
     response_json(http_client.send_all_request(token=token, **CART_ITEM))
     try:
-        yield token
+        yield order_address
     finally:
         http_client.send_all_request(method="DELETE", url=item_url, token=token)
 
@@ -377,6 +341,25 @@ ORDER_ADDRESS = {
     "receiverName": "李四",
     "receiverPhone": "13987654321",
 }
+
+
+@pytest.fixture(scope="class")
+def order_address(http_client):
+    """Use an address owned by this test user, independent of seed IDs."""
+    token = _login(http_client, USER_LOGIN)
+    response = http_client.send_all_request(
+        method="POST",
+        url=api_url("/api/users/addresses"),
+        token=token,
+        json={**ORDER_ADDRESS, "isDefault": False},
+    )
+    address_id = int(response_value(response, "$.data.addressId"))
+    try:
+        yield ApiResource(token, address_id)
+    finally:
+        delete_resource(
+            http_client, "DELETE", f"/api/users/addresses/{address_id}", token
+        )
 
 
 @pytest.fixture
@@ -422,8 +405,8 @@ def address_resource(http_client, user_token, address_cleanup):
 
 
 @pytest.fixture(scope="class")
-def cancel_order(http_client):
-    scenario = _create_order_via_api(http_client)
+def cancel_order(http_client, order_address):
+    scenario = _create_order_via_api(http_client, order_address)
     try:
         yield scenario
     finally:
@@ -436,8 +419,8 @@ def cancel_order(http_client):
 
 
 @pytest.fixture(scope="class")
-def pay_order(http_client):
-    scenario = _create_order_via_api(http_client)
+def pay_order(http_client, order_address):
+    scenario = _create_order_via_api(http_client, order_address)
     try:
         yield scenario
     finally:
@@ -452,16 +435,16 @@ def pay_order(http_client):
 
 
 @pytest.fixture(scope="class")
-def ship_order(http_client):
-    scenario = _create_order_via_api(http_client)
+def ship_order(http_client, order_address):
+    scenario = _create_order_via_api(http_client, order_address)
     _order_action(http_client, scenario, f"/api/orders/{scenario.order_id}/pay")
     scenario.token = _login(http_client, ADMIN_LOGIN)
     yield scenario
 
 
 @pytest.fixture(scope="class")
-def confirm_order(http_client):
-    scenario = _create_order_via_api(http_client)
+def confirm_order(http_client, order_address):
+    scenario = _create_order_via_api(http_client, order_address)
     _order_action(http_client, scenario, f"/api/orders/{scenario.order_id}/pay")
     scenario.token = _order_action(
         http_client, scenario, f"/api/admin/orders/{scenario.order_id}/ship", admin=True
@@ -471,15 +454,15 @@ def confirm_order(http_client):
 
 
 @pytest.fixture(scope="class")
-def refund_create(http_client):
-    scenario = _create_order_via_api(http_client)
+def refund_create(http_client, order_address):
+    scenario = _create_order_via_api(http_client, order_address)
     _order_action(http_client, scenario, f"/api/orders/{scenario.order_id}/pay")
     yield scenario
 
 
 @pytest.fixture(scope="class")
-def approve_refund(http_client):
-    scenario = _create_order_via_api(http_client)
+def approve_refund(http_client, order_address):
+    scenario = _create_order_via_api(http_client, order_address)
     _order_action(http_client, scenario, f"/api/orders/{scenario.order_id}/pay")
     refund = http_client.send_all_request(
         method="POST",
@@ -493,8 +476,8 @@ def approve_refund(http_client):
 
 
 @pytest.fixture(scope="class")
-def reject_refund(http_client):
-    scenario = _create_order_via_api(http_client)
+def reject_refund(http_client, order_address):
+    scenario = _create_order_via_api(http_client, order_address)
     _order_action(http_client, scenario, f"/api/orders/{scenario.order_id}/pay")
     refund = http_client.send_all_request(
         method="POST",
